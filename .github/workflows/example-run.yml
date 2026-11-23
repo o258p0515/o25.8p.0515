@@ -33,7 +33,6 @@ jobs:
           MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
           MCP_OAUTH_CLIENT_ID: ${{ secrets.MCP_OAUTH_CLIENT_ID }}
           MCP_OAUTH_CLIENT_SECRET: ${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
-          MCP_OAUTH_REDIRECT_URIS: ${{ secrets.MCP_OAUTH_REDIRECT_URIS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -44,10 +43,9 @@ jobs:
           MCP_TOKEN="$(trim "${MCP_TOKEN:-}")"
           MCP_OAUTH_CLIENT_ID="$(trim "${MCP_OAUTH_CLIENT_ID:-}")"
           MCP_OAUTH_CLIENT_SECRET="$(trim "${MCP_OAUTH_CLIENT_SECRET:-}")"
-          MCP_OAUTH_REDIRECT_URIS="$(trim "${MCP_OAUTH_REDIRECT_URIS:-}")"
 
           missing=()
-          for name in CF_API_EMAIL CF_API_KEY CF_DOMAIN MCP_TOKEN MCP_OAUTH_CLIENT_ID MCP_OAUTH_CLIENT_SECRET MCP_OAUTH_REDIRECT_URIS; do
+          for name in CF_API_EMAIL CF_API_KEY CF_DOMAIN MCP_TOKEN MCP_OAUTH_CLIENT_ID MCP_OAUTH_CLIENT_SECRET; do
             if [ -z "${!name:-}" ]; then missing+=("$name"); fi
           done
           if [ "${#missing[@]}" -gt 0 ]; then
@@ -75,10 +73,6 @@ jobs:
           fi
           if [ "${#MCP_OAUTH_CLIENT_ID}" -lt 5 ] || [ "${#MCP_OAUTH_CLIENT_SECRET}" -lt 16 ]; then
             echo "::error title=Invalid OAuth client credentials::MCP_OAUTH_CLIENT_ID or MCP_OAUTH_CLIENT_SECRET is too short; copy the exact registered client credentials."
-            exit 1
-          fi
-          if [[ "$MCP_OAUTH_REDIRECT_URIS" != *https://* ]]; then
-            echo "::error title=Invalid OAuth redirect URI list::MCP_OAUTH_REDIRECT_URIS must contain at least one HTTPS redirect URI registered for this OAuth client."
             exit 1
           fi
           echo "Preflight validation passed: required secrets are present and basic formats are valid."
@@ -230,7 +224,6 @@ jobs:
           MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
           MCP_OAUTH_CLIENT_ID: ${{ secrets.MCP_OAUTH_CLIENT_ID }}
           MCP_OAUTH_CLIENT_SECRET: ${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
-          MCP_OAUTH_REDIRECT_URIS: ${{ secrets.MCP_OAUTH_REDIRECT_URIS }}
           TUNNEL_TOKEN: ${{ steps.cloudflare.outputs.tunnel_token }}
           TS_TRUST_CREDS: ${{ secrets.TS_TRUST_CREDS }}
           TS_TAGS: ${{ secrets.TS_TAGS }}
