@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: o258p0515/localmcpcoder-go
+          ref: main
+          path: source
           persist-credentials: false
 
       # GitHub Actions concurrency (group + cancel-in-progress) already stops
@@ -81,13 +84,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: source/go/go.mod
 
       - name: Build MCP server for this runner
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/localmcpcoder"
-          cd go
+          test -f source/go/go.mod
+          cd source/go
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64" ./cmd/mcp
           test -s "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64"
           echo "Go build succeeded; binary size: $(stat -c '%s bytes' "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64")"
