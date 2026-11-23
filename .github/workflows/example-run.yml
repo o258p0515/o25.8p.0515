@@ -1,0 +1,263 @@
+# Trigger fresh runner through dispatch-example-run workflow.
+name: Example remote MCP runner
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: public-mcp-runner
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # GitHub Actions concurrency (group + cancel-in-progress) already stops
+      # the previous runner. Avoid a second paginated cancellation API call.
+
+      - name: Validate required runner secrets
+        env:
+          CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_DOMAIN: ${{ secrets.CF_DOMAIN }}
+          MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
+          MCP_OAUTH_CLIENT_ID: ${{ secrets.MCP_OAUTH_CLIENT_ID }}
+          MCP_OAUTH_CLIENT_SECRET: ${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
+          MCP_OAUTH_REDIRECT_URIS: ${{ secrets.MCP_OAUTH_REDIRECT_URIS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+          CF_API_EMAIL="$(trim "${CF_API_EMAIL:-}")"
+          CF_API_KEY="$(trim "${CF_API_KEY:-}")"
+          CF_DOMAIN="$(trim "${CF_DOMAIN:-}")"
+          MCP_TOKEN="$(trim "${MCP_TOKEN:-}")"
+          MCP_OAUTH_CLIENT_ID="$(trim "${MCP_OAUTH_CLIENT_ID:-}")"
+          MCP_OAUTH_CLIENT_SECRET="$(trim "${MCP_OAUTH_CLIENT_SECRET:-}")"
+          MCP_OAUTH_REDIRECT_URIS="$(trim "${MCP_OAUTH_REDIRECT_URIS:-}")"
+
+          missing=()
+          for name in CF_API_EMAIL CF_API_KEY CF_DOMAIN MCP_TOKEN MCP_OAUTH_CLIENT_ID MCP_OAUTH_CLIENT_SECRET MCP_OAUTH_REDIRECT_URIS; do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error title=Missing repository secrets::The following required secrets are empty or missing: %s\n' "${missing[*]}"
+            echo "Open Settings > Secrets and variables > Actions and configure each listed secret."
+            exit 1
+          fi
+
+          if [[ ! "$CF_API_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+            echo "::error title=Invalid Cloudflare email::CF_API_EMAIL must be the login email for the Cloudflare account that owns the Global API Key. Do not put an API token or key here."
+            exit 1
+          fi
+          if [ "${#CF_API_KEY}" -lt 20 ]; then
+            echo "::error title=Invalid Cloudflare Global API Key::CF_API_KEY is unexpectedly short. Copy the Global API Key from Cloudflare Profile > API Tokens; do not use an API Token in this Global-Key authentication workflow."
+            exit 1
+          fi
+          HOST="$(printf '%s' "$CF_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')"
+          if [[ ! "$HOST" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+            echo "::error title=Invalid CF_DOMAIN::Expected a bare DNS hostname such as mcp.example.com; remove https://, paths, ports, spaces, and wildcards."
+            exit 1
+          fi
+          if [ "${#MCP_TOKEN}" -lt 32 ]; then
+            echo "::error title=Weak MCP_TOKEN::MCP_TOKEN must be at least 32 characters. Generate a random value, for example: openssl rand -hex 32."
+            exit 1
+          fi
+          if [ "${#MCP_OAUTH_CLIENT_ID}" -lt 5 ] || [ "${#MCP_OAUTH_CLIENT_SECRET}" -lt 16 ]; then
+            echo "::error title=Invalid OAuth client credentials::MCP_OAUTH_CLIENT_ID or MCP_OAUTH_CLIENT_SECRET is too short; copy the exact registered client credentials."
+            exit 1
+          fi
+          if [[ "$MCP_OAUTH_REDIRECT_URIS" != *https://* ]]; then
+            echo "::error title=Invalid OAuth redirect URI list::MCP_OAUTH_REDIRECT_URIS must contain at least one HTTPS redirect URI registered for this OAuth client."
+            exit 1
+          fi
+          echo "Preflight validation passed: required secrets are present and basic formats are valid."
+          echo "Cloudflare hostname: $HOST"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: go/go.mod
+
+      - name: Build MCP server for this runner
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/localmcpcoder"
+          cd go
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64" ./cmd/mcp
+          test -s "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64"
+          echo "Go build succeeded; binary size: $(stat -c '%s bytes' "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64")"
+
+      - name: Provision Cloudflare named tunnel and DNS
+        id: cloudflare
+        env:
+          CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_DOMAIN: ${{ secrets.CF_DOMAIN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CF_API_EMAIL="$(printf '%s' "$CF_API_EMAIL" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          CF_API_KEY="$(printf '%s' "$CF_API_KEY" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          HOST="$(printf '%s' "$CF_DOMAIN" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\.$//')"
+          API="https://api.cloudflare.com/client/v4"
+
+          cf_api() {
+            local label="$1" method="$2" path="$3" data="${4:-}" response status body
+            local -a args
+            args=(--silent --show-error --connect-timeout 15 --max-time 60 --write-out $'\n%{http_code}'
+              -X "$method" "$API$path"
+              -H "X-Auth-Email: $CF_API_EMAIL"
+              -H "X-Auth-Key: $CF_API_KEY"
+              -H "Content-Type: application/json")
+            [ -z "$data" ] || args+=(--data "$data")
+            if ! response="$(curl "${args[@]}")"; then
+              echo "::error title=Cloudflare network error::$label: curl failed to connect or timed out. Check runner network access and Cloudflare API availability."
+              return 1
+            fi
+            status="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+            if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+              echo "::error title=Cloudflare HTTP error::$label returned HTTP $status ($method $path)"
+              printf '%s\n' "$body" | jq -c '{success,errors, messages}' 2>/dev/null || echo "Cloudflare returned a non-JSON response."
+              return 1
+            fi
+            if ! jq -e 'type == "object" and has("success")' >/dev/null 2>&1 <<<"$body"; then
+              echo "::error title=Invalid Cloudflare API response::$label returned HTTP $status but the response was not a valid Cloudflare JSON object."
+              return 1
+            fi
+            if [ "$(jq -r '.success' <<<"$body")" != "true" ]; then
+              echo "::error title=Cloudflare API rejected request::$label failed; Cloudflare error details follow."
+              jq -c '{errors, messages}' <<<"$body" >&2
+              return 1
+            fi
+            printf '%s' "$body"
+          }
+
+          echo "::group::Cloudflare authentication preflight"
+          USER_JSON="$(cf_api "Verify Global API Key and account email" GET "/user")"
+          API_EMAIL="$(jq -r '.result.email // empty' <<<"$USER_JSON" | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_EMAIL="$(printf '%s' "$CF_API_EMAIL" | tr '[:upper:]' '[:lower:]')"
+          if [ -z "$API_EMAIL" ]; then
+            echo "::error title=Cloudflare identity missing::GET /user succeeded but did not return result.email; verify that CF_API_KEY is a Global API Key."
+            exit 1
+          fi
+          if [ "$API_EMAIL" != "$EXPECTED_EMAIL" ]; then
+            echo "::error title=Cloudflare email/key mismatch::CF_API_EMAIL does not match the account email associated with CF_API_KEY. Update both repository secrets from the same Cloudflare account."
+            exit 1
+          fi
+          echo "Cloudflare credentials authenticated for $API_EMAIL."
+          echo "::endgroup::"
+
+          echo "::group::Resolve Cloudflare zone"
+          ZONE_JSON=""
+          IFS='.' read -r -a LABELS <<< "$HOST"
+          for ((i=0; i<${#LABELS[@]}-1; i++)); do
+            CANDIDATE="$(IFS=.; echo "${LABELS[*]:i}")"
+            ENCODED_CANDIDATE="$(jq -rn --arg value "$CANDIDATE" '$value | @uri')"
+            RESPONSE="$(cf_api "Find zone $CANDIDATE" GET "/zones?name=$ENCODED_CANDIDATE")"
+            if [ "$(jq '.result | length' <<<"$RESPONSE")" -gt 0 ]; then ZONE_JSON="$RESPONSE"; break; fi
+          done
+          if [ -z "$ZONE_JSON" ]; then
+            echo "::error title=Cloudflare zone not found::No zone matching $HOST or its parent domains is visible to this Cloudflare account. Add the domain to this account or correct CF_DOMAIN."
+            exit 1
+          fi
+          ZONE_ID="$(jq -r '.result[0].id // empty' <<<"$ZONE_JSON")"
+          ACCOUNT_ID="$(jq -r '.result[0].account.id // empty' <<<"$ZONE_JSON")"
+          if [ -z "$ZONE_ID" ] || [ -z "$ACCOUNT_ID" ]; then
+            echo "::error title=Incomplete Cloudflare zone data::The zone response has no zone ID or account ID. Check account access and zone permissions."
+            exit 1
+          fi
+          echo "Resolved zone $(jq -r '.result[0].name' <<<"$ZONE_JSON") (ID masked)."
+          echo "::endgroup::"
+
+          echo "::group::Create or reuse named tunnel"
+          TUNNEL_NAME="localmcpcoder-${HOST//./-}"
+          ENCODED_TUNNEL_NAME="$(jq -rn --arg value "$TUNNEL_NAME" '$value | @uri')"
+          RESPONSE="$(cf_api "Find tunnel $TUNNEL_NAME" GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$ENCODED_TUNNEL_NAME&is_deleted=false")"
+          TUNNEL_ID="$(jq -r '.result[0].id // empty' <<<"$RESPONSE")"
+          if [ -z "$TUNNEL_ID" ]; then
+            CREATE_BODY="$(jq -nc --arg name "$TUNNEL_NAME" '{name:$name,config_src:"cloudflare"}')"
+            RESPONSE="$(cf_api "Create tunnel $TUNNEL_NAME" POST "/accounts/$ACCOUNT_ID/cfd_tunnel" "$CREATE_BODY")"
+            TUNNEL_ID="$(jq -r '.result.id // empty' <<<"$RESPONSE")"
+          fi
+          if [[ ! "$TUNNEL_ID" =~ ^[a-f0-9-]{36}$ ]]; then
+            echo "::error title=Invalid Cloudflare tunnel ID::Cloudflare did not return a valid tunnel UUID. Check account permissions and the API response above."
+            exit 1
+          fi
+          TOKEN_RESPONSE="$(cf_api "Get tunnel connector token" GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token")"
+          TUNNEL_TOKEN="$(jq -r '.result // empty' <<<"$TOKEN_RESPONSE")"
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            echo "::error title=Empty tunnel token::Cloudflare returned no connector token. Ensure the API key has Cloudflare Tunnel read permission."
+            exit 1
+          fi
+          echo "::add-mask::$TUNNEL_TOKEN"
+          echo "Tunnel exists and connector token was retrieved."
+          echo "::endgroup::"
+
+          echo "::group::Configure tunnel ingress and DNS"
+          CONFIG="$(jq -nc --arg host "$HOST" '{config:{ingress:[{hostname:$host,service:"http://127.0.0.1:8787"},{service:"http_status:404"}]}}')"
+          cf_api "Configure tunnel ingress for $HOST" PUT "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" "$CONFIG" >/dev/null
+
+          ENCODED_HOST="$(jq -rn --arg value "$HOST" '$value | @uri')"
+          DNS="$(cf_api "Find DNS record for $HOST" GET "/zones/$ZONE_ID/dns_records?type=CNAME&name=$ENCODED_HOST")"
+          DNS_ID="$(jq -r '.result[0].id // empty' <<<"$DNS")"
+          RECORD="$(jq -nc --arg name "$HOST" --arg content "$TUNNEL_ID.cfargotunnel.com" '{type:"CNAME",name:$name,content:$content,proxied:true}')"
+          if [ -n "$DNS_ID" ]; then
+            cf_api "Update CNAME for $HOST" PUT "/zones/$ZONE_ID/dns_records/$DNS_ID" "$RECORD" >/dev/null
+          else
+            cf_api "Create CNAME for $HOST" POST "/zones/$ZONE_ID/dns_records" "$RECORD" >/dev/null
+          fi
+          echo "Tunnel ingress and proxied CNAME configured for $HOST."
+          echo "::endgroup::"
+
+          echo "tunnel_token=$TUNNEL_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "Cloudflare provisioning completed successfully for https://$HOST"
+
+      - name: Run MCP server
+        env:
+          MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
+          MCP_OAUTH_CLIENT_ID: ${{ secrets.MCP_OAUTH_CLIENT_ID }}
+          MCP_OAUTH_CLIENT_SECRET: ${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
+          MCP_OAUTH_REDIRECT_URIS: ${{ secrets.MCP_OAUTH_REDIRECT_URIS }}
+          TUNNEL_TOKEN: ${{ steps.cloudflare.outputs.tunnel_token }}
+          TS_TRUST_CREDS: ${{ secrets.TS_TRUST_CREDS }}
+          TS_TAGS: ${{ secrets.TS_TAGS }}
+          TS_HOSTNAME: localmcpcoder-gha
+          MCP_HOST: ${{ steps.cloudflare.outputs.host }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TUNNEL_TOKEN:-}" ] || [ -z "${MCP_HOST:-}" ]; then
+            echo "::error title=Missing Cloudflare outputs::The tunnel provisioning step did not export a connector token or hostname."
+            exit 1
+          fi
+          ROOT="$RUNNER_TEMP/mcp-root"
+          mkdir -p "$ROOT"
+          echo "Starting MCP server; public endpoint: https://$MCP_HOST/mcp"
+          echo "Sensitive credentials are masked and will not be printed."
+          set +e
+          timeout --signal=TERM --kill-after=10s 20700s \
+            "$RUNNER_TEMP/localmcpcoder/mcp-linux-amd64" \
+            --root "$ROOT" --tunnel cloudflare --host "$MCP_HOST"
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 124 ]; then
+            echo "Planned 5h45m runner lifetime reached; graceful shutdown completed."
+            exit 0
+          fi
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error title=MCP server exited unexpectedly::MCP process returned exit code $STATUS. Review the preceding application and tunnel logs."
+          fi
+          exit "$STATUS"
